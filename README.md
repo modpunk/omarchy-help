@@ -58,15 +58,21 @@ index uses, so it lands on the heading every time (verified on all 272 sections)
 
 <img src="docs/img/chat.png" alt="Chat with steps to run" width="760">
 
-Ask a question in your own words. The local model picks the manual section that
-answers it, answers from that section and the matching keybinding and command
-cards, and keeps the section pinned for follow-ups. Under every answer:
+Ask anything in your own words. For an Omarchy question, the local model picks
+the manual section that answers it. It answers from that section and the
+matching keybinding and command cards, and keeps the section pinned for
+follow-ups. For anything else, like a recipe, a patio or a Python question, it
+answers from its own knowledge. Omarchy keybindings, commands and config paths
+still come only from the manual. Under every answer:
 
 - the **source** with an *Open manual* button;
 - the **steps** the answer proposes, one *Run* button each, with a caption that
   says what the command reads and writes and whether it is allowlisted;
 - a placeholder like `<name>` is filled in from the conversation, and the
   resolved command is shown on the button before it can run.
+
+- a **Build it** card when you asked for something Omarchy does not do (see
+  below).
 
 The model is llama.cpp serving a 4B model on your GPU, bound to `127.0.0.1`,
 under a hardened systemd user unit. The whole loop works with the network cable
@@ -98,6 +104,33 @@ list defends against model mistakes and foot-guns, not an adversary; a string
 matcher over shell text cannot be complete, and there is no untrusted input
 channel here. `omarchy-local-agent --check '<cmd>'` prints the verdict the panel
 would apply.
+
+### Build what's missing
+
+Ask for something Omarchy can't do, like "a button in the bar that orders me a
+pizza". The answer says so and offers **Build it…**. *Build something new…* in
+the chat bar opens the same sheet at any time. You choose:
+
+- **As:** an *Omarchy plugin*, or a *web app on the omarchy.fans cloud stack*
+  (Cloudflare Worker, Hono API on Fly.io with Postgres, GitHub-flow CI with
+  blue/green canaries).
+- **Built by:** your default coding agent, starting now, or **Rix**, your AI
+  orchestrator, the way J.A.R.V.I.S.\* is to Tony Stark. Rix plans the work and
+  delegates it to worker agents through the Agent Launcher.
+  The default agent is Hermes via the launcher, on the same backend Rix uses.
+  Set `build_client` to `claude`, `codex`, `grok`, `gemini` or `opencode` to use
+  one of those instead.
+- **The brief:** editable. The sheet says in one line whether it stays on this
+  computer or goes to a cloud service.
+
+Press **Do it.** A short scene plays: a hooded figure, lightning, and the line.
+Click or Esc to skip it. Closing the window mid-scene starts nothing. The CLI
+then creates `~/Work/<name>` (`projects_dir`) with `BRIEF.md`, `AGENTS.md`
+(stack guide and rules, including "ask before creating paid cloud resources")
+and `CLAUDE.md`, and starts the builder there. Nothing you or the model typed
+reaches a shell: the request travels as JSON, every launch is an argv list, and
+the build terminal re-checks the folder and the builder before it runs.
+
 
 ### Follows your Omarchy theme
 
@@ -177,6 +210,9 @@ models, the config file), so nothing large disappears without you asking.
 | Ctrl+N | | new chat |
 | Esc | clear the query, then close | back to search |
 
+In the **Build it** sheet, Ctrl+Enter is *Do it.*, Tab moves between fields and
+Esc cancels. During the scene, Esc or a click skips to the hand-off.
+
 ## CLI
 
 `omarchy-local-agent` answers on the command line too:
@@ -187,11 +223,14 @@ omarchy-local-agent --repl                            # interactive
 omarchy-local-agent --open-section 06-themes#0        # open the manual there
 omarchy-local-agent --run 'omarchy theme set <name>'  # terminal with the command on an editable prompt
 omarchy-local-agent --check 'sudo pacman -Syu'        # policy verdict and read/write preview
+omarchy-local-agent --build-options                   # what Build it can offer, and where each choice runs
+omarchy-local-agent --build request.json              # one build request: {target, via, feature, brief}
 ```
 
 `--search-daemon` and `--chat-daemon` are the JSON-lines interfaces the window
 uses. Configuration lives in `~/.config/omarchy-local-agent/config.json`
-(server URL, temperature, token and injection budgets).
+(server URL, temperature, token and injection budgets, `general_max_tokens`,
+`build_client`, `projects_dir`).
 
 ## How it works
 
@@ -202,7 +241,14 @@ not exist on this machine. A "how do I" question goes through PageIndex: the
 model reads a cached outline of the manual (numbered sections, so a small model
 only has to emit an integer), names one section, gets that section verbatim, and
 answers from it. The first call is nearly free because llama.cpp caches the
-static prefix. Retrieval is guarded by a regression harness (`tools/eval.py`,
+static prefix. Before navigating, a one-word call (~150 ms) asks whether the
+question is about the computer at all. Only when it says no does navigation get
+a "0: nothing in the manual is relevant" exit into general mode. Offering that
+exit on every question sent "how do I change the wallpaper" to general
+knowledge. Gated, navigation holds 28/30 against 27/30 before, with no false
+exits (`tools/route-eval.py`). The same harness checks that off-topic questions
+aren't refused, that missing features get a Build card and real ones don't, on
+tuned and held-out sets. Retrieval is guarded by a regression harness (`tools/eval.py`,
 24/27 held-out cases). The model is chosen by navigation accuracy on the
 held-out questions (`tools/nav-eval.py`) when the difference is significant
 (`tools/headtohead.py`, exact McNemar); when it is not, general capability
@@ -217,11 +263,13 @@ default.
 | Path | What |
 |------|------|
 | `HelpPanel.qml`, `BarWidget.qml`, `manifest.json` | the plugin (a thin client over the CLI) |
+| `DoItScene.qml` | the "Do it." hand-off scene: two aligned monospace layers, themed |
 | `bin/omarchy-local-agent` | search, chat, explain, open, run, policy |
 | `bin/omarchy-local-agent-index` | builds the index; keeps the bind-count and corpus-collapse guards |
 | `tools/eval.py` | retrieval regression harness: run after any change to retrieval, ranking, stopwords, weights or the outline; report the held-out number, never tune against it |
 | `tools/bench.sh`, `tools/bench-gpu.sh`, `tools/bench-results*.txt` | throughput bake-offs (CPU and GPU) across the candidate models |
 | `tools/nav-eval.py`, `tools/headtohead.py` | navigation accuracy per model over the 30 held-out questions, and a per-item head-to-head with an exact McNemar test so a difference can be called significant rather than eyeballed |
+| `tools/route-eval.py` | routing: Omarchy navigation against a baseline CLI (McNemar), off-topic questions answered, missing features flagged; `--answers --heldout` for the untuned set |
 | `tools/fetch-models.sh` | downloads models pinned to immutable Hugging Face revisions and verifies their SHA-256 before installing |
 | `docs/local-agent.md` | the CLI's own design notes |
 | `systemd/omarchy-local-agent.service` | llama-server user unit (GPU offload, hardened) |
@@ -235,3 +283,8 @@ not point the indexer at master.
 ## License
 
 MIT. An [omarchy.fans](https://omarchy.fans) project ([OmarchyFans](https://github.com/OmarchyFans) on GitHub); modpunk is the main contributor.
+
+---
+
+\* J.A.R.V.I.S. and Tony Stark are trademarks of Marvel. Omarchy.Fans is not
+affiliated with or endorsed by Marvel.

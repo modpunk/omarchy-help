@@ -6,7 +6,8 @@ import qs.Ui
 
 // Offline help for Omarchy: live search over this machine's keybindings, the
 // omarchy CLI, and the manual pinned to the installed version, plus a chat
-// with the local model about what to do.
+// with the local model about anything. When Omarchy cannot do what the user
+// wants, "Build it" hands the feature to Rix or a coding client.
 //
 // The window is a normal toplevel (FloatingWindow), not an overlay: it stays
 // on the workspace while a command runs in a terminal or the manual opens
@@ -43,6 +44,16 @@ Item {
   property bool chatSlow: false
   property int requestId: 0
   property int streamIndex: -1
+  property string chatMode: ""          // "omarchy" | "general", from the daemon
+
+  // build state ("Build it"): the sheet, the scene, and the reply
+  property bool buildOpen: false
+  property bool buildBusy: false
+  property var buildOpts: null
+  property string buildTarget: "plugin"  // "plugin" | "webapp"
+  property string buildVia: "client"     // "client" | "rix"
+  property string buildError: ""
+  property int buildRequestId: 0         // negative ids: never collide with chat ids
 
   property color background: Color.menu.background
   // Solid backdrop for screenshots (the menu surface is translucent by theme);
@@ -80,6 +91,8 @@ Item {
 
   // Esc walks back: chat -> search, query -> empty, empty -> close.
   function back() {
+    if (doIt.visible) { doIt.skip(); return }
+    if (buildOpen) { closeBuild(); return }
     if (mode === "chat") { leaveChat(); return }
     if (input.text !== "") { input.text = ""; return }
     requestClose()
@@ -100,7 +113,7 @@ Item {
     results.clear()
     results.append({ kind: "hint", primary: "Type to search keybindings, commands and the manual",
                      secondary: "", sid: "" })
-    results.append({ kind: "hint", primary: "Examples:  nightlight  ·  screenshot  ·  how do I change my theme",
+    results.append({ kind: "hint", primary: "Examples:  nightlight  ·  screenshot  ·  how do I change my theme  ·  or ask anything",
                      secondary: "", sid: "" })
     results.append({ kind: "hint", primary: "Enter runs a command, opens the manual, or starts a chat.  Shift+Enter adds a line.",
                      secondary: "", sid: "" })
@@ -115,7 +128,7 @@ Item {
     results.clear()
     if (filterText.length > 2)
       results.append({ kind: "ask", primary: "Chat with the local agent: " + filterText,
-                       secondary: "answers from the manual, then keeps the conversation going", sid: "" })
+                       secondary: "answers anything; Omarchy questions come from the manual", sid: "" })
 
     var i
     for (i = 0; i < (data.binds || []).length; i++)
@@ -232,7 +245,7 @@ Item {
   }
   function newChat() {
     messages.clear()
-    chatSid = ""; chatHeading = ""; chatSource = ""
+    chatSid = ""; chatHeading = ""; chatSource = ""; chatMode = ""
     chatBusy = false; chatSlow = false; streamIndex = -1
     requestId++            // orphan any reply still streaming
     input.text = ""
@@ -251,8 +264,8 @@ Item {
       var m = messages.get(i)
       if (m.text) history.push({ role: m.role, content: m.text })
     }
-    messages.append({ role: "user", text: query, sid: "", heading: "", source: "", steps: "[]" })
-    messages.append({ role: "assistant", text: "", sid: "", heading: "", source: "", steps: "[]" })
+    messages.append({ role: "user", text: query, sid: "", heading: "", source: "", steps: "[]", build: "" })
+    messages.append({ role: "assistant", text: "", sid: "", heading: "", source: "", steps: "[]", build: "" })
     streamIndex = messages.count - 1
     chatBusy = true; chatSlow = false; slowTimer.restart()
     requestId++
@@ -264,9 +277,11 @@ Item {
   function onChatLine(line) {
     var d
     try { d = JSON.parse(line) } catch (e) { return }
+    if (d && typeof d.id === "number" && d.id < 0) { onBuildReply(d); return }
     if (!d || d.id !== requestId) return
     if (streamIndex < 0 || streamIndex >= messages.count) return
     if (d.status) {
+      chatMode = d.mode || ""
       if (d.sid) { chatSid = d.sid; chatHeading = d.heading || ""; chatSource = d.source || "" }
       return
     }
@@ -277,6 +292,9 @@ Item {
       return
     }
     if (d.done) {
+      // The daemon strips the "BUILD:" marker line; take its cleaned text.
+      if (d.text !== undefined && d.text !== "") messages.setProperty(streamIndex, "text", d.text)
+      messages.setProperty(streamIndex, "build", d.build ? d.build.feature : "")
       stamp(d)
       messages.setProperty(streamIndex, "steps", JSON.stringify(d.steps || []))
       finishWith("")
@@ -304,6 +322,85 @@ Item {
     }
     streamIndex = -1
     transcript.positionViewAtEnd()
+  }
+
+  // ---- build it ---------------------------------------------------------
+
+  function chatHistory() {
+    var h = []
+    for (var i = 0; i < messages.count; i++) {
+      var m = messages.get(i)
+      if (m.text) h.push({ role: m.role, content: m.text })
+    }
+    return h
+  }
+  function lastQuestion() {
+    for (var i = messages.count - 1; i >= 0; i--)
+      if (messages.get(i).role === "user") return messages.get(i).text
+    return filterText
+  }
+  function openBuild(feature, brief) {
+    buildFeatureInput.text = feature || ""
+    buildBriefInput.text = brief || feature || ""
+    buildTarget = /\b(web ?app|website|site|saas|online|server|api|dashboard|sign ?up|accounts?)\b/i.test((feature || "") + " " + (brief || "")) ? "webapp" : "plugin"
+    buildVia = "client"
+    buildError = ""
+    buildBusy = false
+    buildOpen = true
+    buildRequestId--
+    if (chatProc.running) chatProc.write(JSON.stringify({ id: buildRequestId, build_options: true }) + "\n")
+    Qt.callLater(function() { (feature ? buildBriefInput : buildFeatureInput).forceActiveFocus() })
+  }
+  function closeBuild() { buildOpen = false; buildBusy = false; doIt.cancel(); focusInput() }
+  function viaAvailable(via) {
+    if (!buildOpts) return false
+    return via === "rix" ? buildOpts.rix_available : buildOpts.client_available
+  }
+  function buildReady() {
+    return buildOpen && !buildBusy && !doIt.visible && buildFeatureInput.text.trim() !== "" && viaAvailable(buildVia)
+  }
+  function doItBuild() {
+    if (!buildReady()) {
+      if (buildFeatureInput.text.trim() === "") buildError = "Say what to build first."
+      else if (buildOpts && !viaAvailable(buildVia))
+        buildError = buildVia === "rix" ? "Rix is " + buildOpts.rix_where + "." : buildOpts.client_label + " " + buildOpts.client_where + "."
+      return
+    }
+    buildError = ""
+    doIt.start()
+  }
+  // Called when the scene finishes (or is skipped). Never called if the
+  // window closed mid-scene: cancel() stops it without finishing.
+  function sendBuild() {
+    if (!buildOpen || !window.visible) return
+    if (!chatProc.running) { buildError = "The helper is not running."; return }
+    buildBusy = true
+    buildRequestId--
+    chatProc.write(JSON.stringify({ id: buildRequestId, build: {
+      target: buildTarget, via: buildVia,
+      feature: buildFeatureInput.text.trim(), brief: buildBriefInput.text.trim(),
+      transcript: chatHistory() } }) + "\n")
+  }
+  function onBuildReply(d) {
+    if (d.build_options) { buildOpts = d.build_options; return }
+    if (d.id !== buildRequestId) return
+    buildBusy = false
+    if (d.built) {
+      buildOpen = false
+      flash("Building with " + d.built.via + " in  " + d.built.path)
+      focusInput()
+    } else if (d.error) {
+      buildError = d.error + (d.hint ? "\n" + d.hint : "") + (d.path ? "\nProject folder: " + d.path : "")
+    }
+  }
+  function whereLine() {
+    if (!buildOpts) return "Checking what is available…"
+    var local = buildVia === "rix" ? buildOpts.rix_local : buildOpts.client_local
+    var name = buildVia === "rix" ? "Rix" : buildOpts.client_label
+    var where = buildVia === "rix" ? buildOpts.rix_where : buildOpts.client_where
+    return name + " " + where + (viaAvailable(buildVia)
+      ? (local ? ".  Nothing leaves this computer." : ".  The brief and this conversation leave this computer.")
+      : ".")
   }
 
   ListModel { id: results }
@@ -344,6 +441,7 @@ Item {
     minimumSize: Qt.size(480, 320)
 
     onVisibleChanged: {
+      if (!visible) { doIt.cancel(); root.buildOpen = false; root.buildBusy = false }
       if (!visible && !root.closingFromHost && root.shell && typeof root.shell.hide === "function") root.shell.hide(root.pluginId)
     }
 
@@ -432,7 +530,8 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             width: parent.width - chatActions.width - parent.spacing
             textFormat: Text.PlainText
-            text: root.chatHeading ? "Reading:  " + root.chatHeading + (root.chatSource ? "   ·   " + root.chatSource : "") : "Picking a manual section…"
+            text: root.chatHeading ? "Reading:  " + root.chatHeading + (root.chatSource ? "   ·   " + root.chatSource : "")
+                : root.chatMode === "general" ? "Answering from general knowledge" : "Picking a manual section…"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -442,6 +541,7 @@ Item {
             id: chatActions
             spacing: Style.space(4)
             Button { text: "Open manual"; bordered: true; fontSize: Style.font.caption; foreground: root.foreground; fontFamily: root.fontFamily; visible: root.chatSid !== ""; onClicked: root.openSection(root.chatSid) }
+            Button { text: "Build something new…"; bordered: true; fontSize: Style.font.caption; foreground: root.foreground; fontFamily: root.fontFamily; onClicked: root.openBuild("", root.lastQuestion()) }
             Button { text: "New chat"; bordered: true; fontSize: Style.font.caption; foreground: root.foreground; fontFamily: root.fontFamily; onClicked: root.newChat() }
             Button { text: "Back to search"; bordered: true; fontSize: Style.font.caption; foreground: root.foreground; fontFamily: root.fontFamily; onClicked: root.leaveChat() }
           }
@@ -710,6 +810,39 @@ Item {
                   }
                 }
               }
+              Rectangle {
+                width: parent.width
+                visible: !msg.mine && !msg.streaming && msg.model.build !== ""
+                height: visible ? buildRow.implicitHeight + Style.space(12) : 0
+                radius: Style.space(6)
+                color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.08)
+                border.width: 1
+                border.color: root.accent
+                Row {
+                  id: buildRow
+                  anchors.left: parent.left; anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(8); anchors.rightMargin: Style.space(6)
+                  spacing: Style.space(8)
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - buildBtn.width - parent.spacing
+                    textFormat: Text.PlainText
+                    text: "Not built in yet:  " + msg.model.build
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.Wrap
+                  }
+                  Button {
+                    id: buildBtn
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Build it…"; bordered: true; fontSize: Style.font.caption
+                    foreground: root.accent; fontFamily: root.fontFamily
+                    onClicked: root.openBuild(msg.model.build, root.lastQuestion())
+                  }
+                }
+              }
               Row {
                 visible: !msg.mine && msg.model.sid !== ""
                 spacing: Style.space(6)
@@ -742,6 +875,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
             text: root.notice ? root.notice
+                : root.buildOpen ? "ctrl+↵ do it   tab next field   esc cancel"
                 : root.mode === "chat" ? "↵ send   ⇧↵ new line   ctrl+n new chat   esc back to search"
                 : (function() {
                     var k = root.selectedKind
@@ -757,6 +891,168 @@ Item {
             elide: Text.ElideRight
           }
         }
+      }
+
+      // ---- build sheet ----
+      Rectangle {
+        id: buildSheet
+        anchors.fill: parent
+        anchors.margins: root.contentMargin
+        anchors.bottomMargin: root.contentMargin + root.footerHeight + root.contentSpacing
+        visible: root.buildOpen
+        color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.98)
+        radius: Style.cornerRadius
+        border.width: 1
+        border.color: root.accent
+        MouseArea { anchors.fill: parent }        // keep clicks off the transcript beneath
+
+        function keys(event) {
+          var enter = event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+          if (event.key === Qt.Key_Escape) { root.back(); event.accepted = true }
+          else if (enter && (event.modifiers & Qt.ControlModifier)) { root.doItBuild(); event.accepted = true }
+        }
+
+        Column {
+          anchors.fill: parent
+          anchors.margins: Style.space(14)
+          spacing: Style.space(8)
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Build it"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.heading
+            font.bold: true
+          }
+
+          Text { textFormat: Text.PlainText; text: "What to build"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+          Rectangle {
+            width: parent.width
+            height: buildFeatureInput.implicitHeight + Style.space(12)
+            radius: Style.space(6)
+            color: root.faint
+            border.width: 1
+            border.color: buildFeatureInput.activeFocus ? root.accent : root.border
+            TextInput {
+              id: buildFeatureInput
+              anchors.fill: parent
+              anchors.margins: Style.space(6)
+              color: root.foreground
+              selectionColor: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              clip: true
+              KeyNavigation.tab: buildBriefInput
+              Keys.onPressed: function(event) { buildSheet.keys(event) }
+              onAccepted: buildBriefInput.forceActiveFocus()
+            }
+          }
+
+          Row {
+            spacing: Style.space(6)
+            Text { anchors.verticalCenter: parent.verticalCenter; width: Style.space(64); textFormat: Text.PlainText; text: "As"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+            Button { text: "Omarchy plugin"; bordered: true; selected: root.buildTarget === "plugin"; fontSize: Style.font.caption; foreground: root.buildTarget === "plugin" ? root.accent : root.foreground; fontFamily: root.fontFamily; onClicked: root.buildTarget = "plugin" }
+            Button { text: "Web app on omarchy.fans cloud"; bordered: true; selected: root.buildTarget === "webapp"; fontSize: Style.font.caption; foreground: root.buildTarget === "webapp" ? root.accent : root.foreground; fontFamily: root.fontFamily; onClicked: root.buildTarget = "webapp" }
+          }
+          Row {
+            spacing: Style.space(6)
+            Text { anchors.verticalCenter: parent.verticalCenter; width: Style.space(64); textFormat: Text.PlainText; text: "Built by"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+            Button {
+              text: (root.buildOpts ? root.buildOpts.client_label : "Coding agent") + ", start coding now"
+              bordered: true; selected: root.buildVia === "client"; fontSize: Style.font.caption
+              foreground: root.buildVia === "client" ? root.accent : root.foreground; fontFamily: root.fontFamily
+              onClicked: root.buildVia = "client"
+            }
+            Button {
+              text: "Rix, plan and orchestrate"
+              bordered: true; selected: root.buildVia === "rix"; fontSize: Style.font.caption
+              foreground: root.buildVia === "rix" ? root.accent : root.foreground; fontFamily: root.fontFamily
+              onClicked: root.buildVia = "rix"
+            }
+          }
+
+          Text { textFormat: Text.PlainText; text: "Brief (edit freely: this is what the builder reads)"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+          Rectangle {
+            width: parent.width
+            height: Math.max(Style.space(60), parent.height - y - whereText.height - (buildErrorText.visible ? buildErrorText.height + Style.space(8) : 0) - actionsRow.height - Style.space(8) * 2)
+            radius: Style.space(6)
+            color: root.faint
+            border.width: 1
+            border.color: buildBriefInput.activeFocus ? root.accent : root.border
+            Flickable {
+              id: briefFlick
+              anchors.fill: parent
+              anchors.margins: Style.space(6)
+              contentWidth: width
+              contentHeight: buildBriefInput.contentHeight
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              TextEdit {
+                id: buildBriefInput
+                width: briefFlick.width
+                wrapMode: TextEdit.Wrap
+                color: root.foreground
+                selectionColor: root.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                selectByMouse: true
+                KeyNavigation.tab: buildFeatureInput
+                Keys.priority: Keys.BeforeItem
+                Keys.onPressed: function(event) { buildSheet.keys(event) }
+              }
+            }
+          }
+
+          Text {
+            id: whereText
+            width: parent.width
+            textFormat: Text.PlainText
+            text: root.whereLine()
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.Wrap
+          }
+          Text {
+            id: buildErrorText
+            width: parent.width
+            visible: root.buildError !== ""
+            textFormat: Text.PlainText
+            text: root.buildError
+            color: root.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.Wrap
+          }
+          Row {
+            id: actionsRow
+            spacing: Style.space(6)
+            Button {
+              text: root.buildBusy ? "Starting…" : "Do it."
+              bordered: true; fontSize: Style.font.body
+              foreground: root.buildReady() ? root.accent : root.dim; fontFamily: root.fontFamily
+              enabled: !root.buildBusy
+              onClicked: root.doItBuild()
+            }
+            Button {
+              text: "Cancel"; bordered: true; fontSize: Style.font.body
+              foreground: root.foreground; fontFamily: root.fontFamily
+              onClicked: root.closeBuild()
+            }
+          }
+        }
+      }
+
+      // ---- the "Do it." scene: plays, then hands off ----
+      DoItScene {
+        id: doIt
+        anchors.fill: parent
+        foreground: root.foreground
+        accent: root.accent
+        background: root.background
+        fontFamily: root.fontFamily
+        onFinished: root.sendBuild()
       }
     }
   }
