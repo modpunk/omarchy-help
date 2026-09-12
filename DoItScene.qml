@@ -28,27 +28,28 @@ Rectangle {
   // ---- art ------------------------------------------------------------------
 
   readonly property var figure: [
-    "              .-''''''-.              ",
-    "            .'          '.            ",
-    "           /   .------.   \\           ",
-    "          |   /        \\   |          ",
-    "          |  |          |  |          ",
-    "          |  |          |  |          ",
-    "          |   \\        /   |          ",
-    "           \\   '.____.'   /           ",
-    "           /'.          .'\\           ",
-    "          /   '-.____.-'   \\          ",
-    "         /  /|          |\\  \\         ",
-    "        '--' |          | '--'        ",
-    "             |__________|             ",
-    "                                      ",
-    "                                      "
+    "                   /\\                   ",
+    "                 .'  '.                 ",
+    "               .'      '.               ",
+    "              /   ____   \\              ",
+    "             |   /::::\\   |             ",
+    "             |  |:    :|  |             ",
+    "             |  |::::::|  |             ",
+    "             |   \\::::/   |             ",
+    "            /|    `--'    |\\            ",
+    "           / |            | \\           ",
+    "      ,___/  |            |  \\___,      ",
+    "            /|            |\\            ",
+    "          .' |            | '.          ",
+    "         /___|____________|___\\         ",
+    "                                        "
   ]
-  // [row, column, text] marks drawn in the accent colour.
-  readonly property var eyes: [[4, 16, "-"], [4, 21, "-"]]
-  readonly property var eyesOpen: [[4, 16, "o"], [4, 21, "o"]]
-  readonly property var boltA: [[11, 5, "\\/\\"], [11, 30, "/\\/"], [12, 3, "/\\/  "], [12, 30, "  \\/\\"]]
-  readonly property var boltB: [[11, 4, "/\\/\\"], [11, 30, "/\\/\\"], [13, 2, "\\/\\/"], [13, 32, "\\/\\/"]]
+  // [row, column, text] marks drawn in the accent colour. Every mark lands on
+  // a blank cell of the figure, so the two layers never overprint.
+  readonly property var eyes: [[5, 18, "-"], [5, 21, "-"]]
+  readonly property var eyesOpen: [[5, 18, "o"], [5, 21, "o"]]
+  readonly property var boltA: [[10, 1, "/\\/\\/"], [10, 34, "/\\/\\/"], [9, 3, "\\/"], [11, 36, "/\\"]]
+  readonly property var boltB: [[10, 1, "\\/\\/\\"], [10, 34, "\\/\\/\\"], [11, 2, "/\\/"], [9, 35, "\\/\\"]]
 
   function blank() {
     var out = []

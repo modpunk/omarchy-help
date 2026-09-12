@@ -975,7 +975,7 @@ Item {
           Text { textFormat: Text.PlainText; text: "Brief (edit freely: this is what the builder reads)"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
           Rectangle {
             width: parent.width
-            height: Math.max(Style.space(60), parent.height - y - whereText.height - buildErrorText.height - actionsRow.height - Style.space(8) * 3)
+            height: Math.max(Style.space(60), parent.height - y - whereText.height - (buildErrorText.visible ? buildErrorText.height + Style.space(8) : 0) - actionsRow.height - Style.space(8) * 2)
             radius: Style.space(6)
             color: root.faint
             border.width: 1
@@ -1018,7 +1018,6 @@ Item {
             id: buildErrorText
             width: parent.width
             visible: root.buildError !== ""
-            height: visible ? implicitHeight : 0
             textFormat: Text.PlainText
             text: root.buildError
             color: root.accent
