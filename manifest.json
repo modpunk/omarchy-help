@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.modpunk.omarchy-help",
   "name": "Omarchy Help",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "modpunk",
   "license": "MIT",
-  "description": "Offline help for Omarchy, in a window that stays open. Type to search your live keybindings, the omarchy CLI, and the manual for your installed version; results appear as you type with no network and no model. Run a command straight from the results in a floating terminal, open the manual at the matching section, or chat with the local GPU model about what to do.",
+  "description": "Help for Omarchy that acts, not just answers. Type to search your live keybindings, the omarchy CLI and the manual for your installed version, with no network and no model. Run a command in a floating terminal, open the manual at the matching section, or chat with the local GPU model about anything. When Omarchy can't do something, Build it hands the feature to Rix or your coding agent as a plugin or an omarchy.fans cloud web app.",
   "kinds": [
     "panel",
     "bar-widget"
