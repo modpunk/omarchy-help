@@ -47,6 +47,7 @@ DEFAULTS = {
     "fast_path_margin": 1.0,
     "temperature": 0.2,
     "max_tokens": 400,
+    "general_max_tokens": 900,
 }
 
 ANSI = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -309,14 +310,18 @@ def render_toc():
     return load_toc()[0]
 
 
+# Wording matters more than it looks: this prompt is also the prefix for the
+# navigation call, and a friendlier "help with anything" system prompt cost two
+# navigation hits on the prose set (27 -> 25 of 30). The permission to answer
+# from general knowledge lives in the per-question turn instead (answer_prompt),
+# which is what actually removed the refusals. Measured with tools/route-eval.py.
 SYSTEM = """You are a local assistant for Omarchy, an Arch Linux distribution \
-running Hyprland. You answer strictly from the Omarchy manual for THIS machine's \
+running Hyprland. You know Omarchy from the manual for THIS machine's \
 installed version.
 
 Rules:
-- Answer only from text you are given. Never invent a keybinding, command, or \
-config path.
-- If what you were given does not answer the question, say so plainly.
+- Take Omarchy facts only from text you are given. Never invent a keybinding, \
+command, or config path.
 - Be brief. Two or three sentences, or a short list. No preamble.
 - Quote keybindings and commands exactly as written in the source.
 
@@ -326,6 +331,144 @@ Manual outline — chapter titles, with their numbered sections beneath:
 
 def build_system():
     return SYSTEM.format(toc=render_toc())
+
+
+# Navigation may answer 0: nothing in the manual is relevant (a recipe, a patio,
+# a Python question). That routes to general mode, where no manual text is
+# injected and the model answers from its own knowledge. 0.2 had no such exit,
+# so every off-topic question was forced onto some section and then refused
+# with "the manual does not cover this".
+GENERAL = {"sid": "", "chapter": "", "heading": "", "body": "", "source": "",
+           "general": True}
+
+
+def is_general(sec):
+    return bool(sec and sec.get("general"))
+
+
+# The model marks a request for something Omarchy cannot do with a last line
+# "BUILD: <feature>". The panel turns it into a "Build it" card; it is stripped
+# from the answer the user reads and from the stored transcript.
+BUILD_HOW = ("If, and only if, the user wants their Omarchy computer to do "
+             "something that neither Omarchy nor its installed apps can do, say "
+             "plainly that it is not built in, then end your reply with one final "
+             "line: BUILD: <what to build, in one short sentence>")
+
+BUILD_RE = re.compile(r"^[ \t>*_`-]*BUILD:[*_` \t]*(.+?)[*_` \t]*$", re.M | re.I)
+
+
+# A cheap first question, ~150ms on the GPU with a tiny prompt of its own:
+# is this about the computer at all? Offering navigation a "0 = nothing
+# relevant" exit on every question produced a false exit on "how do I change
+# the wallpaper"; offering it only when this gate says OTHER keeps real
+# questions on the 0.2 navigation path while recipes and patios leave it.
+TOPIC_SYSTEM = (
+    "You sort questions asked on an Omarchy Linux computer (Arch Linux, Hyprland "
+    "desktop). Reply with exactly one word.\n"
+    "COMPUTER: the question is about using, configuring or changing this computer, "
+    "its desktop, apps, hardware, files, network or Linux, or asks the computer to "
+    "do something.\n"
+    "OTHER: anything else, such as cooking, home projects, general knowledge, or "
+    "programming questions not about this machine.")
+
+
+def on_topic(cfg, query):
+    raw = chat(cfg, TOPIC_SYSTEM, f"Question: {query}\nOne word, COMPUTER or OTHER:",
+               max_tokens=4, temperature=0.0)
+    return "OTHER" not in raw.upper()
+
+
+# Whether to offer "Build it" at all. The topic gate alone is not enough: it
+# calls "a button in the bar that orders me a pizza" OTHER. Without the offer, a
+# patio answer that says "Omarchy cannot build a patio" would become a build.
+DESKTOPISH = re.compile(
+    r"\b(omarchy|hyprland|linux|desktop|computer|laptop|pc|machine|bar|panel|"
+    r"widget|plugin|app|apps|application|menu|window|screen|keyboard|"
+    r"terminal|notification|wallpaper|theme)s?\b", re.I)
+
+
+def route(db, cfg, system, query, res):
+    """Pick the evidence for an answer. Returns (section or GENERAL, offer_build)."""
+    computer = on_topic(cfg, query)
+    offer = computer or bool(DESKTOPISH.search(query))
+    if not computer and not res["sections"]:
+        return GENERAL, offer          # nothing to navigate to; skip the call
+    sec, _ = navigate(db, cfg, system, query, res["sections"], allow_general=not computer)
+    if sec is None:
+        sec = res["sections"][0] if res["sections"] else GENERAL
+    return sec, offer
+
+
+# A 4B model often says "Omarchy doesn't have a built-in X" and then forgets
+# the BUILD line. When it says so in words, one short dedicated call names the
+# feature instead.
+NOT_BUILT = re.compile(
+    r"(doesn.t|does not|don.t|do not|isn.t|is not|can.t|cannot|no)\s+"
+    r"(have\s+(a|any)\s+)?(built[- ]in|native(ly)?|support|include|come with|"
+    r"a feature|such a feature|ship)", re.I)
+
+BUILD_SYSTEM = ("You name software features. Reply with one short sentence that "
+                "describes the feature to build, starting with a verb, or the "
+                "single word NONE.")
+
+
+def detect_build(cfg, query, text, offer):
+    """Return (answer without BUILD lines, feature or None)."""
+    cleaned, feature = split_build(text)
+    if not offer:
+        return cleaned, None
+    if feature or not NOT_BUILT.search(cleaned):
+        return cleaned, feature
+    try:
+        raw = chat(cfg, BUILD_SYSTEM,
+                   f"The user asked their Omarchy computer: {query}\n"
+                   f"The assistant answered: {cleaned[:1200]}\n\n"
+                   "If the answer says Omarchy cannot already do what the user wants, "
+                   "describe the missing feature in one sentence. Otherwise reply NONE.",
+                   max_tokens=48, temperature=0.0)
+    except ServerDown:
+        return cleaned, None
+    line = raw.strip().splitlines()[0].strip().strip("`*\"") if raw.strip() else ""
+    if not line or line.upper().startswith("NONE"):
+        return cleaned, None
+    return cleaned, line.rstrip(".")
+
+
+def split_build(text):
+    """Return (answer without BUILD lines, feature or None)."""
+    m = BUILD_RE.search(text or "")
+    if not m:
+        return text, None
+    feature = m.group(1).strip().rstrip(".")
+    cleaned = BUILD_RE.sub("", text).rstrip()
+    return cleaned, (feature or None)
+
+
+def answer_tokens(cfg, general, chat=False):
+    """Manual answers are two or three sentences; a recipe or a how-to from
+    general knowledge is a numbered list and was being cut off at 400."""
+    base = cfg["max_tokens"] * (2 if chat else 1)
+    return max(base, cfg["general_max_tokens"]) if general else base
+
+
+def answer_prompt(query, sec, cfg, cards=None, chat=False, offer_build=True):
+    """The user turn for one answer. Omarchy mode injects the section; general
+    mode injects nothing and says so, which is what stops the refusal."""
+    ctx = ""
+    if sec and not is_general(sec):
+        ctx += (f"MANUAL SECTION {sec['sid']} ({sec['chapter']} - {sec['heading']}):\n"
+                f"{sec['body'][:cfg['max_inject_chars']]}\n\n")
+    if cards:
+        ctx += "MATCHING CARDS FROM THE INDEX:\n" + "\n".join(cards) + "\n\n"
+    convo = " and the conversation so far" if chat else ""
+    if ctx:
+        how = (f"Use the material above{convo} for anything Omarchy-specific. Where "
+               "it is silent, answer from your own knowledge, but never invent an "
+               "Omarchy keybinding, command or config path.")
+    else:
+        how = (f"The Omarchy manual does not cover this. Answer helpfully from your "
+               f"own knowledge{convo}. Do not mention the manual.")
+    return f"{ctx}QUESTION: {query}\n\n{how}" + (f"\n{BUILD_HOW}" if offer_build else "")
 
 
 # --------------------------------------------------------------------------
@@ -404,7 +547,7 @@ SECTION_RE = re.compile(r"[0-9a-z][0-9a-z-]*#\d+")
 CHAPTER_RE = re.compile(r"\b(\d{2}-[a-z0-9-]+|skill-[a-z0-9-]+)\b")
 
 
-def navigate(db, cfg, system, query, candidates):
+def navigate(db, cfg, system, query, candidates, allow_general=False):
     """PageIndex call 1: model picks a section id from the cached outline.
 
     BM25's top hits are offered as a hint, but the model may pick anything in
@@ -424,7 +567,9 @@ def navigate(db, cfg, system, query, candidates):
             hint = "\n\nLexical search suggests these, but choose freely:\n" + "\n".join(rows)
 
     user = (f"QUESTION: {query}{hint}\n\n"
-            "Reply with ONE section number from the outline and nothing else.")
+            "Reply with ONE section number from the outline and nothing else."
+            + (" If no part of the Omarchy manual is relevant to the question, reply 0."
+               if allow_general else ""))
     # Navigation is a lookup, not a creative act: greedy decoding only. The
     # token budget is generous enough that a model which emits a reasoning
     # block anyway still gets to the number (see prose_smoke in bench.sh).
@@ -432,6 +577,10 @@ def navigate(db, cfg, system, query, candidates):
 
     # Preferred form: a bare section number.
     m = re.search(r"\b(\d{1,4})\b", raw)
+    # 0 must be honoured before the fallbacks below: they would otherwise
+    # drag an off-topic question back onto whatever chapter BM25 liked.
+    if allow_general and m and int(m.group(1)) == 0:
+        return GENERAL, raw
     if m:
         sec = get_section(db, numbers.get(int(m.group(1)), ""))
         if sec:
@@ -524,7 +673,7 @@ def answer(db, cfg, query, system, verbose=False):
 
     # Prose path.
     try:
-        sec, raw = navigate(db, cfg, system, query, res["sections"])
+        sec, offer = route(db, cfg, system, query, res)
     except ServerDown as e:
         print()
         print(c("  llama-server is not reachable.", "1;33"))
@@ -538,32 +687,29 @@ def answer(db, cfg, query, system, verbose=False):
         print()
         return res
 
-    if sec is None:
-        sec = res["sections"][0] if res["sections"] else None
-    if sec is None:
-        print(f"\n  Nothing in the manual matched {query!r}.\n")
-        return res
-
-    res["chosen_section"] = sec["sid"]
-    body = sec["body"][:cfg["max_inject_chars"]]
-    user = (f"QUESTION: {query}\n\n"
-            f"MANUAL SECTION {sec['sid']} ({sec['chapter']} - {sec['heading']}):\n"
-            f"{body}\n\n"
-            "Answer the question using only this section. If it does not "
-            "contain the answer, say so.")
+    general = is_general(sec)
+    res["chosen_section"] = "" if general else sec["sid"]
+    res["mode"] = "general" if general else "omarchy"
+    user = answer_prompt(query, sec, cfg, offer_build=offer)
     try:
-        reply = chat(cfg, system, user)
+        reply = chat(cfg, system, user, max_tokens=answer_tokens(cfg, general))
     except ServerDown as e:
         print(f"\n  {c('llama-server went away:', '1;33')} {e}\n")
         return res
 
+    reply, feature = detect_build(cfg, query, reply, offer)
+    res["build"] = feature
     print()
     print(wrap(reply, indent="  "))
+    if feature:
+        print()
+        print(c(f"  Not built in. The help panel can start building: {feature}", "1;36"))
     print()
-    print(render_sources([f"{time.time() - t0:.2f}s", sec["source"],
-                          f"§{sec['heading']}"]))
+    print(render_sources([f"{time.time() - t0:.2f}s"]
+                         + (["general knowledge (model)"] if general
+                            else [sec["source"], f"§{sec['heading']}"])))
     if verbose:
-        print(c(f"  [nav -> {sec['sid']}; injected {len(body)} chars]", "2"))
+        print(c(f"  [nav -> {sec['sid'] or 'general'}]", "2"))
     return res
 
 
@@ -708,14 +854,9 @@ def explain_section(sid, query):
     if sec is None:
         print(f"No such section: {sid}")
         return 1
-    body = sec["body"][:cfg["max_inject_chars"]]
-    user = (f"QUESTION: {query}\n\n"
-            f"MANUAL SECTION {sec['sid']} ({sec['chapter']} - {sec['heading']}):\n"
-            f"{body}\n\n"
-            "Answer the question using only this section. If it does not "
-            "contain the answer, say so.")
+    user = answer_prompt(query, sec, cfg)
     try:
-        print(chat(cfg, build_system(), user))
+        print(split_build(chat(cfg, build_system(), user))[0])
     except ServerDown as e:
         print(f"The local model is not running.\n\n{e}\n\n"
               f"Start it with:  systemctl --user start omarchy-local-agent\n\n"
@@ -741,14 +882,18 @@ def chat_context(db, cfg, system, query, sid):
     res = retrieve(db, query, cfg)
     sec = get_section(db, sid) if sid else None
     if sec is None:
-        sec, _ = navigate(db, cfg, system, query, res["sections"])
-        if sec is None and res["sections"]:
-            sec = res["sections"][0]
+        sec, offer = route(db, cfg, system, query, res)
+    else:
+        offer = True
+    if is_general(sec):
+        # near_best() is relative to the best hit, so an off-topic question
+        # would still carry three unrelated cards into the prompt.
+        return sec, [], offer
     cards = [f"keybinding {b['keys']}: {b['description']}"
              for b in near_best(res["binds"])[:3]]
     cards += [f"command {cm['route']}: {cm['summary']}"
               for cm in near_best(res["commands"])[:3]]
-    return sec, cards
+    return sec, cards, offer
 
 
 def chat_daemon():
@@ -786,20 +931,13 @@ def chat_daemon():
         try:
             if system is None:
                 system = build_system() + CHAT_SUFFIX
-            sec, cards = chat_context(db, cfg, system, query, sid)
+            sec, cards, offer = chat_context(db, cfg, system, query, sid)
+            general = is_general(sec)
             emit({"id": rid, "status": "generating",
-                  "sid": sec["sid"] if sec else "",
-                  "heading": sec["heading"] if sec else "",
-                  "source": sec["source"] if sec else ""})
-            ctx = ""
-            if sec:
-                ctx += (f"MANUAL SECTION {sec['sid']} ({sec['chapter']} - {sec['heading']}):\n"
-                        f"{sec['body'][:cfg['max_inject_chars']]}\n\n")
-            if cards:
-                ctx += "MATCHING CARDS FROM THE INDEX:\n" + "\n".join(cards) + "\n\n"
-            user = (f"{ctx}QUESTION: {query}\n\n"
-                    "Answer from the material above and the conversation so far. "
-                    "If they do not contain the answer, say so.")
+                  "mode": "general" if general else "omarchy",
+                  "sid": sec["sid"], "heading": sec["heading"],
+                  "source": sec["source"]})
+            user = answer_prompt(query, sec, cfg, cards, chat=True, offer_build=offer)
             messages = [{"role": "system", "content": system}]
             for h in history[-8:]:
                 if h.get("role") in ("user", "assistant") and h.get("content"):
@@ -809,7 +947,8 @@ def chat_daemon():
 
             hidden = False
             answer_text = ""
-            for delta in chat_stream(cfg, messages, max_tokens=cfg["max_tokens"] * 2):
+            for delta in chat_stream(cfg, messages,
+                                     max_tokens=answer_tokens(cfg, general, chat=True)):
                 # Drop a reasoning block if the template emitted one anyway.
                 if "<think>" in delta:
                     hidden = True
@@ -819,18 +958,22 @@ def chat_daemon():
                     continue
                 answer_text += delta
                 emit({"id": rid, "delta": delta})
+            answer_text, feature = detect_build(cfg, query, answer_text, offer)
             transcript = messages[1:-1] + [{"role": "user", "content": query},
                                            {"role": "assistant", "content": answer_text}]
-            emit({"id": rid, "done": True,
-                  "steps": analyse_steps(cfg, system, transcript, answer_text, db),
-                  "sid": sec["sid"] if sec else "",
-                  "heading": sec["heading"] if sec else "",
-                  "source": sec["source"] if sec else "",
-                  "seconds": round(time.time() - t0, 1)})
+            done = {"id": rid, "done": True, "text": answer_text,
+                    "mode": "general" if general else "omarchy",
+                    "steps": analyse_steps(cfg, system, transcript, answer_text, db),
+                    "sid": sec["sid"], "heading": sec["heading"],
+                    "source": sec["source"],
+                    "seconds": round(time.time() - t0, 1)}
+            if feature:
+                done["build"] = {"feature": feature}
+            emit(done)
         except ServerDown as e:
             out = {"id": rid, "error": f"{NOT_RUNNING}\n\n{e}",
                    "hint": "systemctl --user start omarchy-local-agent"}
-            if sec:
+            if sec and not is_general(sec):
                 out.update({"sid": sec["sid"], "heading": sec["heading"],
                             "source": sec["source"],
                             "fallback": sec["body"][:1500]})
