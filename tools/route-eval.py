@@ -47,6 +47,27 @@ EXISTING = [
     "how do I connect to wifi",
     "how do I record my screen",
 ]
+# Held out: written after tuning, never adjusted against. Run with --heldout.
+HELDOUT_GENERAL = [
+    "how do I change a flat tire",
+    "write me a haiku about autumn",
+    "how many cups are in a gallon",
+    "how should I prepare for a job interview",
+    "explain how vaccines train the immune system",
+    "what is a good beginner workout routine",
+]
+HELDOUT_MISSING = [
+    "can omarchy track my screen time per app and email me a weekly report",
+    "make omarchy turn my smart lights red when a calendar meeting starts",
+    "I want a widget on my desktop that shows my plant sensor readings",
+    "can omarchy automatically translate the text in any window into spanish",
+]
+HELDOUT_EXISTING = [
+    "how do I lock my screen",
+    "how do I change my keyboard layout",
+    "how do I install a new app",
+    "how do I use the clipboard history",
+]
 REFUSAL = ("don't have information", "do not have information", "not covered",
            "provided material", "manual does not", "manual doesn't",
            "cannot help with", "can't help with", "not in the manual")
@@ -105,6 +126,7 @@ def main():
     ap.add_argument("--candidate", default=os.path.join(HERE, "..", "bin", "omarchy-local-agent"))
     ap.add_argument("--answers", action="store_true")
     ap.add_argument("--show", action="store_true", help="print answer excerpts")
+    ap.add_argument("--heldout", action="store_true", help="use the held-out answer sets")
     args = ap.parse_args()
 
     base = load(args.baseline, "baseline")
@@ -143,12 +165,14 @@ def main():
                 print("       " + " ".join(text.split())[:220])
 
     refused = lambda t: any(r in t.lower() for r in REFUSAL)
-    rows = [(q, *ask(cand, cfg, db, system, q)) for q in GENERAL]
+    gen, mis, ex = ((HELDOUT_GENERAL, HELDOUT_MISSING, HELDOUT_EXISTING) if args.heldout
+                    else (GENERAL, MISSING, EXISTING))
+    rows = [(q, *ask(cand, cfg, db, system, q)) for q in gen]
     report("Off-topic -> general, no refusal, no build", rows,
            lambda r: r[1] and not refused(r[2]) and not r[3])
-    rows = [(q, *ask(cand, cfg, db, system, q)) for q in MISSING]
+    rows = [(q, *ask(cand, cfg, db, system, q)) for q in mis]
     report("Missing feature -> BUILD line", rows, lambda r: bool(r[3]))
-    rows = [(q, *ask(cand, cfg, db, system, q)) for q in EXISTING]
+    rows = [(q, *ask(cand, cfg, db, system, q)) for q in ex]
     report("Existing feature -> no BUILD, manual mode", rows,
            lambda r: not r[3] and not r[1])
     print(f"\n({time.time() - t0:.0f}s)")
