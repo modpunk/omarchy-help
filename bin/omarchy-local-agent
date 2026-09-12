@@ -1588,6 +1588,8 @@ def write_project(cfg, target, feature, brief, transcript):
     brief_md = (f"# {feature.strip()[:120]}\n\n"
                 f"Requested from Omarchy Help on {time.strftime('%Y-%m-%d')}.\n"
                 f"Target: **{TARGETS[target]}**. Work in `{path}`.\n\n"
+                "**Read `AGENTS.md` in that folder first:** the stack guide and the rules "
+                "(ask before anything destructive, outward-facing or paid).\n\n"
                 f"## What to build\n\n{brief.strip()}\n\n"
                 + ("## The conversation that led here\n\n" + "\n\n".join(convo) + "\n\n"
                    if convo else "")
@@ -1641,21 +1643,52 @@ def handle_build(cfg, req):
         spawn(terminal(path, client))
         return {"built": {"path": path, "via": opts["client_label"], "launched": True}}
 
-    # Hermes through the launcher, on the same backend Rix uses.
+    # Hermes through the launcher, on the same backend Rix uses. The launcher's
+    # `create` overwrites an existing profile of the same name and --launch then
+    # just focuses the old window, so the name must be unique: never truncate
+    # away the folder's -2 suffix, and step past any saved agent.
+    import hashlib
+    import tempfile
     orch = orchestrator()
     prof = orchestrator_profile(orch["name"])
-    name = "build-" + os.path.basename(path)[:28]
+    folder = os.path.basename(path)
+    stem = folder if len(folder) <= 28 else (
+        folder[:21].rstrip("-") + "-" + hashlib.sha1(path.encode()).hexdigest()[:6])
+    agents_dir = os.path.join(HOME, ".config/omarchy-agent-launcher/agents")
+    name, n = "build-" + stem, 2
+    while os.path.exists(os.path.join(agents_dir, name + ".json")):
+        name, n = f"build-{stem}-{n}", n + 1
+
+    # The Hermes session starts in its own home, not the project folder, so the
+    # job itself must carry the rules: BRIEF.md followed by AGENTS.md.
+    with open(os.path.join(path, "BRIEF.md"), encoding="utf-8") as fh:
+        job = fh.read()
+    with open(os.path.join(path, "AGENTS.md"), encoding="utf-8") as fh:
+        job += "\n\n---\n\n" + fh.read()
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8")
+    tmp.write(job)
+    tmp.close()
+
     argv = [LAUNCHER, "create", "--name", name, "--agent", "hermes", "--runtime", "local",
-            "--provider", prof.get("provider", "local"), "--auth", prof.get("auth", "none"),
-            "--model", prof.get("model", ""), "--mode", "interactive",
-            "--job-file", os.path.join(path, "BRIEF.md"), "--launch"]
-    if prof.get("base_url"):
-        argv[argv.index("--mode"):argv.index("--mode")] = ["--base-url", prof["base_url"]]
+            "--mode", "interactive", "--job-file", tmp.name, "--launch"]
+    backend = prof.get("backend") or orch.get("backend")
+    if backend:
+        argv += ["--backend", backend, "--parent", orch["name"], "--task-title", folder]
+    else:   # a launcher without backends: copy Rix's provider settings
+        argv += ["--provider", prof.get("provider", "local"), "--auth", prof.get("auth", "none"),
+                 "--model", prof.get("model", "")]
+        if prof.get("base_url"):
+            argv += ["--base-url", prof["base_url"]]
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=90,
                            stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"error": f"The agent launcher did not start Hermes: {e}", "path": path}
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
     if p.returncode != 0:
         return {"error": "The agent launcher did not start Hermes:\n"
                          + (p.stderr or p.stdout).strip()[-600:], "path": path}
@@ -1683,12 +1716,13 @@ def build_session(path, target_name):
             input("\n  Press Enter to close.")
             return 1
         ask = (f"New project brief from Omarchy Help. Project folder: {real}. Read "
-               f"{real}/BRIEF.md and {real}/AGENTS.md, make a plan, and delegate the work to "
-               "worker agents with omarchy-agent-launcher delegate. Reply with the plan.")
+               f"{real}/BRIEF.md and {real}/AGENTS.md and propose a plan: the steps, which "
+               "worker agents and backends you would use, and the cost. Do not start or "
+               "delegate anything yet; the user will confirm in your chat.")
         import subprocess
         subprocess.run([LAUNCHER, orch["name"], "ask", ask])
         try:
-            input("\n  Press Enter to open Rix's chat, or close this window.")
+            input("\n  Press Enter to open Rix's chat and confirm the plan, or close this window.")
         except EOFError:
             return 0
         os.execvp(LAUNCHER, [LAUNCHER, orch["name"]])
